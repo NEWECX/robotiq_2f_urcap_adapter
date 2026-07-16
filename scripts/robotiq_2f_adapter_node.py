@@ -70,6 +70,15 @@ class Robotiq2fAdapterNode(Node):
             )
         )
         self.declare_parameter(
+            name="gripper_sid",
+            value=9,
+            descriptor=ParameterDescriptor(
+                name="gripper_sid",
+                type=ParameterType.PARAMETER_INTEGER,
+                description="Gripper SID used for communication with URCap server."
+            )
+        )
+        self.declare_parameter(
             name="max_gripper_width",
             value=0.085,
             descriptor=ParameterDescriptor(
@@ -134,6 +143,10 @@ class Robotiq2fAdapterNode(Node):
             if robot_port is None:
                 raise ParameterUninitializedException(parameter_name="robot_port")
 
+            gripper_sid: Optional[int] = self.get_parameter("gripper_sid").value
+            if gripper_sid is None:
+                raise ParameterUninitializedException(parameter_name="gripper_sid")
+
             max_gripper_width_m: Optional[float] = \
                 self.get_parameter("max_gripper_width").value
             if max_gripper_width_m is None:
@@ -167,10 +180,16 @@ class Robotiq2fAdapterNode(Node):
             self.get_logger().error(f"Parameter uninitialized: {exc}")
             raise RuntimeError() from exc\
 
-        self.get_logger().info(f"Connecting to URCAP on {robot_ip}:{robot_port}!")
+        self.get_logger().info(
+            f"Connecting to URCAP on {robot_ip}:{robot_port} with SID={gripper_sid}!"
+        )
 
         self.gripper_adapter: Robotiq2fSocketAdapter = Robotiq2fSocketAdapter()
-        self.gripper_adapter.connect(hostname=robot_ip, port=robot_port)
+        self.gripper_adapter.connect(
+            hostname=robot_ip,
+            port=robot_port,
+            gripper_sid=gripper_sid
+        )
 
         self.get_logger().info(f"Connected to URCAP on {robot_ip}:{robot_port}!")
 

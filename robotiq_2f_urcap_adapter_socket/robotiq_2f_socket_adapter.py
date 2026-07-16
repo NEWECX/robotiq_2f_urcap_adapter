@@ -96,18 +96,29 @@ class Robotiq2fSocketAdapter:
         self._min_force: int = 0
         self._max_force: int = 255
 
-    def connect(self, hostname: str, port: int, socket_timeout: float = 2.0) -> None:
+    def connect(
+        self,
+        hostname: str,
+        port: int,
+        socket_timeout: float = 2.0,
+        gripper_sid: int = 9
+    ) -> None:
         """
         Connect to a Robotiq 2 finger gripper at the given address.
 
         :param hostname: Hostname or ip.
         :param port: Port.
         :param socket_timeout: Timeout for blocking socket operations.
+        :param gripper_sid: Gripper SID used by the URCap string interface.
         """
         with self.socket_lock:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.connect((hostname, port))
             self.socket.settimeout(socket_timeout)
+
+        # Select the configured gripper SID before querying state variables.
+        if not self.set_gripper_variable('SID', gripper_sid):
+            raise RuntimeError(f"Failed to set gripper SID to {gripper_sid}")
 
     def disconnect(self) -> None:
         """Close the connection with the gripper."""
@@ -157,32 +168,65 @@ class Robotiq2fSocketAdapter:
         """
         return self.set_gripper_variables(OrderedDict([(variable, value)]))
 
-    def get_gripper_variable(self, variable: str) -> int:
+    def get_gripper_variable(
+        self,
+        variable: str,
+        max_retries: int = 20,
+        retry_delay_s: float = 0.05
+    ) -> int:
         """
         Get the specified variable value from the gripper using the socket connection.
 
         This command blocks until the response has been received or a timeout occurs.
 
         :param variable: Name of the variable to retrieve.
+        :param max_retries: Number of retries when URCap returns '?'.
+        :param retry_delay_s: Delay between retries for transient '?'.
         :return: Value of the variable as integer.
         """
-        # atomic commands send/rcv
-        cmd = f"{self.__GET_COMMAND} {variable}\n"
         if self.socket is None:
             raise ValueError("Cannot retrieve current value!")
 
-        with self.socket_lock:
-            self.socket.sendall(cmd.encode(self.ENCODING))
-            data = self.socket.recv(1024)
+        cmd = f"{self.__GET_COMMAND} {variable}\n"
+        attempts = max_retries + 1
+        for attempt in range(attempts):
+            with self.socket_lock:
+                self.socket.sendall(cmd.encode(self.ENCODING))
+                data = self.socket.recv(1024)
 
-        var_name, value_str = data.decode(self.ENCODING).split()
-        if var_name != variable:
-            raise ValueError(
-                f"Unexpected response {data} ({data.decode(self.ENCODING)}): "
-                f"does not match '{variable}'"
+            decoded = data.decode(self.ENCODING).strip()
+            response_parts = decoded.split()
+            if len(response_parts) != 2:
+                raise ValueError(
+                    f"Unexpected response format for '{variable}': {decoded!r}"
                 )
-        value = int(value_str)
-        return value
+
+            var_name, value_str = response_parts
+            if var_name != variable:
+                raise ValueError(
+                    f"Unexpected response {data} ({decoded}): "
+                    f"does not match '{variable}'"
+                )
+
+            if value_str == '?':
+                if attempt < max_retries:
+                    time.sleep(retry_delay_s)
+                    continue
+
+                raise ValueError(
+                    f"URCap returned '?' for '{variable}' after {attempts} attempts. "
+                    "Check gripper SID and ensure the gripper is ready in PolyScope."
+                )
+
+            try:
+                return int(value_str)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Unexpected non-integer value for '{variable}': {value_str!r} "
+                    f"(raw response: {decoded!r})"
+                ) from exc
+
+        raise RuntimeError("Unreachable code in get_gripper_variable")
 
     def _is_ack(self, data: bytes) -> bool:
         """
