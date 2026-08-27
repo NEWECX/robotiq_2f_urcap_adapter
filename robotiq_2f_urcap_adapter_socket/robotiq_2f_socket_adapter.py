@@ -89,6 +89,7 @@ class Robotiq2fSocketAdapter:
     def __init__(self):
         self.socket: typing.Optional[socket.socket] = None
         self.socket_lock = threading.Lock()
+        self.last_response = ''
         self._min_position: int = 0
         self._max_position: int = 255
         self._min_speed: int = 0
@@ -101,7 +102,9 @@ class Robotiq2fSocketAdapter:
         hostname: str,
         port: int,
         socket_timeout: float = 2.0,
-        gripper_sid: int = 9
+        gripper_sid: int = 9,
+        sid_retries: int = 20,
+        sid_retry_delay_s: float = 0.1,
     ) -> None:
         """
         Connect to a Robotiq 2 finger gripper at the given address.
@@ -110,6 +113,8 @@ class Robotiq2fSocketAdapter:
         :param port: Port.
         :param socket_timeout: Timeout for blocking socket operations.
         :param gripper_sid: Gripper SID used by the URCap string interface.
+        :param sid_retries: Number of retries when SID selection is not acknowledged.
+        :param sid_retry_delay_s: Delay in seconds between SID retries.
         """
         with self.socket_lock:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -117,8 +122,15 @@ class Robotiq2fSocketAdapter:
             self.socket.settimeout(socket_timeout)
 
         # Select the configured gripper SID before querying state variables.
-        if not self.set_gripper_variable('SID', gripper_sid):
-            raise RuntimeError(f"Failed to set gripper SID to {gripper_sid}")
+        for _ in range(sid_retries + 1):
+            if self.set_gripper_variable('SID', gripper_sid):
+                return
+            time.sleep(sid_retry_delay_s)
+
+        raise RuntimeError(
+            f"Failed to set gripper SID to {gripper_sid} after {sid_retries + 1} attempts; "
+            f"last URCap response was {self.last_response!r}"
+        )
 
     def disconnect(self) -> None:
         """Close the connection with the gripper."""
@@ -153,6 +165,7 @@ class Robotiq2fSocketAdapter:
         with self.socket_lock:
             self.socket.sendall(cmd.encode(self.ENCODING))
             data = self.socket.recv(1024)
+        self.last_response = data.decode(self.ENCODING).strip()
         return self._is_ack(data)
 
     def set_gripper_variable(self, variable: str, value: Union[int, float]):
@@ -236,7 +249,7 @@ class Robotiq2fSocketAdapter:
 
         :return if the data is an acknowledgement message.
         """
-        return data.decode(self.ENCODING) == self.__ACK_MESSAGE
+        return data.decode(self.ENCODING).strip() == self.__ACK_MESSAGE
 
     def _reset(self):
         """Reset the gripper."""
