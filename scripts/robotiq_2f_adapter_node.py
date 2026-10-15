@@ -22,15 +22,18 @@
 # SOFTWARE.
 
 import time
+import threading
 from typing import Optional
 
 import rclpy
 from rclpy.action import ActionServer
+from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node, ParameterDescriptor, ParameterType,\
     ParameterNotDeclaredException, ParameterUninitializedException
 
 from robotiq_2f_urcap_adapter.action import GripperCommand as GripperCommandAction
+from std_srvs.srv import Trigger
 
 from robotiq_2f_urcap_adapter_socket.robotiq_2f_socket_adapter import ObjectStatus
 from robotiq_2f_urcap_adapter_socket.robotiq_2f_socket_adapter import Robotiq2fSocketAdapter
@@ -43,6 +46,8 @@ class Robotiq2fAdapterNode(Node):
         super().__init__("robotiq_2f_urcap_adapter")
 
         self.get_logger().info("Gripper control via urcap setting up!")
+        self._command_lock = threading.Lock()
+        self._stop_generation = 0
 
         self._action_server = ActionServer(
             self,
@@ -50,6 +55,9 @@ class Robotiq2fAdapterNode(Node):
             "~/gripper_command",
             self.execute_callback
         )
+        self.create_service(
+            Trigger, '~/stop', self._stop_callback,
+            callback_group=ReentrantCallbackGroup())
 
         self.declare_parameter(
             name="robot_ip",
@@ -363,11 +371,33 @@ class Robotiq2fAdapterNode(Node):
         self.gripper_adapter.disconnect()
         time.sleep(0.01)
 
+    def _stop_callback(self, _request, response):
+        try:
+            with self._command_lock:
+                self._stop_generation += 1
+                response.success = self.gripper_adapter.set_gripper_variable(
+                    self.gripper_adapter.GTO, 0)
+            response.message = (
+                'Gripper stop acknowledged.' if response.success else 'Gripper rejected STOP.')
+        except (OSError, RuntimeError, ValueError) as error:
+            response.success = False
+            response.message = f'Gripper STOP failed: {error}'
+        if not response.success:
+            self.get_logger().error(response.message)
+        return response
+
+    def _stopped_result(self, goal_handle, generation):
+        if generation == self._stop_generation:
+            return None
+        goal_handle.abort()
+        return GripperCommandAction.Result(reached_goal=False)
+
     def __move_gripper_to_grip_width(self, goal_handle,
                                      grip_width_m: float,
                                      max_effort_N: float,
                                      max_speed_m_s: float
                                      ) -> GripperCommandAction.Result:
+        generation = self._stop_generation
         try:
             target_position_normalized = self.__normalized_grip_width_value_from_m(grip_width_m)
             normalized_speed = self.__normalized_speed_value_from_m_s(max_speed_m_s)
@@ -395,11 +425,15 @@ class Robotiq2fAdapterNode(Node):
                 reached_goal=True
             )
 
-        set_ok, cmd_pos = self.gripper_adapter.move(
-            position=target_position_normalized,
-            speed=normalized_speed,
-            force=normalized_effort
-        )
+        with self._command_lock:
+            stopped = self._stopped_result(goal_handle, generation)
+            if stopped is not None:
+                return stopped
+            set_ok, cmd_pos = self.gripper_adapter.move(
+                position=target_position_normalized,
+                speed=normalized_speed,
+                force=normalized_effort
+            )
         if not set_ok:
             goal_handle.abort()
             return GripperCommandAction.Result(
@@ -414,6 +448,9 @@ class Robotiq2fAdapterNode(Node):
 
         prev_position = self.gripper_adapter.position
         while self.gripper_adapter.get_gripper_variable(self.gripper_adapter.PRE) != cmd_pos:
+            stopped = self._stopped_result(goal_handle, generation)
+            if stopped is not None:
+                return stopped
             position = self.gripper_adapter.position
             if prev_position != position:
                 prev_position = position
@@ -441,6 +478,9 @@ class Robotiq2fAdapterNode(Node):
         prev_speed = self.gripper_adapter.speed
 
         while object_status == ObjectStatus.MOVING:
+            stopped = self._stopped_result(goal_handle, generation)
+            if stopped is not None:
+                return stopped
             object_status = ObjectStatus(
                 self.gripper_adapter.get_gripper_variable(self.gripper_adapter.OBJ)
                 )
@@ -464,6 +504,9 @@ class Robotiq2fAdapterNode(Node):
                     )
                 )
 
+        stopped = self._stopped_result(goal_handle, generation)
+        if stopped is not None:
+            return stopped
         if object_status == ObjectStatus.AT_DEST:
             goal_handle.succeed()
             return GripperCommandAction.Result(
